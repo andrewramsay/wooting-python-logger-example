@@ -121,6 +121,6 @@ if __name__ == "__main__":
                 row = [str(time.time()), str(keys_pressed), '|'.join(map(str, codes_and_values))]
                 logcsv.writerow(row)
                 rows += 1
-                time.sleep(0.001)
+                time.sleep(SLEEP_TIME)
 
             print('Recorded {} data points'.format(rows))
