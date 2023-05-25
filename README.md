@@ -9,7 +9,7 @@ Instructions:
  * Follow the SDK installation instructions for your platform, and find the path to the `libwooting_analog_wrapper` dynamic library (the extension will be `.so`, `.dll` or `.dylib` depending on the platform)
  * Connect a Wooting keyboard
  * Run the script and press `Space` to start checking for keypresses
- * Try pressing some keys: if things are working you'll see `x keys pressed` messages being printed
+ * Try pressing some keys: if things are working you'll see `Keys pressed: <number>` messages being printed
  * To stop recording, just hit `Escape`
  
 Each line of the recorded CSV file will contain 3 fields:
