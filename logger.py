@@ -1,126 +1,211 @@
+import csv
+import os
 import sys
 import time
-import ctypes
-import os
-import csv
+import datetime
+from ctypes import (
+    POINTER,
+    c_float,
+    c_uint16,
+    c_uint32,
+    cast,
+    cdll,
+    create_string_buffer,
+    sizeof,
+    memset,
+)
+from typing import List, Tuple
 
-SCAN_CODE_ESC       = 0x00
-SCAN_CODE_SPACE     = 0x53
+KEYCODES_HID                  = 0
+KEYCODES_SCANCODE1            = 1
+KEYCODES_VIRTUALKEY           = 2
+KEYCODES_VIRTUALKEY_TRANSLATE = 3
 
-SLEEP_TIME          = 0.0001
+SCAN_CODE_ESC       = 41
+SCAN_CODE_SPACE     = 44
 
 class WootingPython(object):
-    
-    def __init__(self, dll='wooting-analog-sdk-x86.dll'):
+    """
+    Implements a simple ctypes interface to some of the functionality in the 
+    Wooting Analog SDK: https://github.com/WootingKb/wooting-analog-sdk
+    """
+
+    def __init__(self, sdk_wrapper_path: str, buffer_size: int = 64) -> None:
+        """
+        Create a new WootingPython instance.
+
+        To access the analog SDK functionality, 3 dynamic libraries need to be
+        installed from the SDK (either using an installer/package or manually).
+
+        There are:
+           - the core SDK itself (libwooting_analog_sdk.so/dll/dylib)
+           - the analog plugin (libwooting_analog_plugin.so/dll/dylib)
+           - the SDK "wrapper" (libwooting_analog_wrapper.so/dll/dylib)
+       
+        The SDK wrapper implements the external API for applications to use, and you
+        must pass the path to a copy of this library to this method. 
+
+        Args:
+            sdk_wrapper_path (str): full filename of the libwooting_analog_wrapper dynamic library
+            buffer_size (int): max number of key states to read from the device with read_full_buffer
+
+        Returns:
+            None
+        """
         try:
-            self._dll = ctypes.cdll.LoadLibrary(dll)
+            self._lib = cdll.LoadLibrary(sdk_wrapper_path)
         except OSError as e:
-            sys.exit('Failed to load dll from "{}" ({})'.format(dll, e))
+            sys.exit(f'Failed to load SDK wrapper library from {sdk_wrapper_path} ({e})')
 
-        self._excluded = []
+        self._excluded = set()
 
-    def set_excluded_keys(self, excluded):
-        self._excluded = excluded
+        # initialise the SDK, check for negative return codes on error
+        result = self._lib.wooting_analog_initialise()
+        if result < 0:
+            raise Exception(f'SDK initialisation failed with error {result}')
 
-    def is_connected(self):
+        self.buffer_size = buffer_size
+        # create ctypes buffers for calling read_full_buffer
+        self.code_buffer = cast(create_string_buffer(buffer_size * sizeof(c_uint16)), POINTER(c_uint16))
+        self.analog_buffer = cast(create_string_buffer(buffer_size * sizeof(c_float)), POINTER(c_float))
+
+    def set_excluded_keys(self, excluded: List[int]) -> None:
         """
-        Returns True if a Wooting One/Two is connected, False if not
+        Update the set of keycodes to be ignored when reading a buffer from the device.
+
+        Args:
+            excluded (List[int]): a set of keycodes/scancodes to be removed from results
+
+        Returns:
+            None
         """
-        return bool(self._dll.wooting_kbd_connected())
+        self._excluded = set(excluded)
 
-    def read_full_buffer(self, items=32):
+    def read_key(self, code: int) -> float:
         """
-        Reads a full buffer from the keyboard. See wooting_read_full_buffer
-        description at:
-        https://dev.wooting.io/wooting-analog-sdk-guide/analog-api-description/
+        Reads the analogue value of a single keycode/scancode.
+
+        This wraps the wooting_analog_read_analog method, which reads
+        the key for the given code from any connected device. See
+        https://github.com/WootingKb/wooting-analog-sdk/blob/develop/includes/wooting-analog-wrapper.h#L67
+
+        Args:
+            code (int): a keycode/scancode
+
+        Returns:
+            float: either an analogue value in the 0.0-1.0 range, or a negative value on error
+        """
+        return self._lib.wooting_analog_read_analog(code)
+
+    def read_full_buffer(self, strip: bool = True) -> List[Tuple[int, float]]:
+        """
+        Reads a full buffer from the keyboard. 
+
+        https://github.com/WootingKb/wooting-analog-sdk/blob/develop/SDK_USAGE.md#read-all-analog-values
+        https://github.com/WootingKb/wooting-analog-sdk/blob/develop/includes/wooting-analog-wrapper.h#L132
+
+        The maximum number of returned key states is set by the buffer_size parameter
+        passed to the constructor. 
+
+        If "strip" is set to True, entries for keycodes which are set to 0 will be removed from the
+        results. 
+
+        If "set_excluded_keys" has been used to create a set of excluded keycodes, these will also be
+        removed from the results. 
+
+        Args:
+            strip (bool): if True, remove entries where the keycode is 0 (usually meaning empty/unset)
+
+        Returns:
+            List[Tuple[int, float]]: a list of (keycode, analog value) pairs up to a max of self.buffer_size
         """
 
-        # number of keypresses that can be retrieved in one operation
-        # (range must be 1-32)
-        items = min(max(1, items), 32) 
+        # clear our ctypes buffers and call the SDK method
+        memset(self.code_buffer, 0, self.buffer_size * sizeof(c_uint16))
+        memset(self.analog_buffer, 0, self.buffer_size * sizeof(c_float))
+        result = self._lib.wooting_analog_read_full_buffer(self.code_buffer, self.analog_buffer, c_uint32(self.buffer_size))
 
-        # buffer is items x 2 bytes to allow for (keycode, analog value) pairs to be returned
-        buffer = ctypes.cast(ctypes.create_string_buffer(items * 2), ctypes.POINTER(ctypes.c_uint8))
-        # call the C function, which returns the number of keys written into the buffer.
-        # the values are interleaved, i.e. scancode1, analogvalue1, scancode2, analogvalue2, ...
-        items_read = self._dll.wooting_read_full_buffer(buffer, ctypes.c_uint32(items))
+        # if the result is negative, it indicates an error
+        if result < 0:
+            print(f'Warning: wooting_analog_read_full_buffer returned an error: {result}')
+            return []
 
-        # separate the two sets of values into their own lists
-        scan_codes, analog_vals, codes_and_vals = [], [], []
-        excl_count = 0
-        for i in range(0, items_read * 2, 2):
-            if buffer[i] in self._excluded:
-                excl_count += 1
-                continue
-            scan_codes.append(buffer[i])
-            codes_and_vals.append(buffer[i])
-            analog_vals.append(buffer[i+1])
-            codes_and_vals.append(buffer[i+1])
+        values = []
+        # if result is >0, it is the number of buffer entries that were populated
+        for x in range(result):
+            if (strip is False or self.code_buffer[x] > 0) and self.code_buffer[x] not in self._excluded:
+                values.append((self.code_buffer[x], self.analog_buffer[x]))
 
-        return items_read - excl_count, scan_codes, analog_vals, codes_and_vals
+        return values
 
-    def wait_for_key(self, scan_code):
+    def wait_for_key(self, code: int) -> None:
         """
-        Blocks until a specific scan code is received
+        Blocks until a specific keycode/scancode is received
+
+        Args:
+            code (int): a keycode/scancode to wait for
+
+        Returns:
+            None
         """
         while True:
-            _, scan_codes, _, _ = self.read_full_buffer()
-            if scan_code in scan_codes:
-                return
+            result = self.read_full_buffer()
+            for value in result:
+                cur_code, _ = value
+                if cur_code == code:
+                    return
 
-            time.sleep(SLEEP_TIME)
+            time.sleep(0.001)
 
-def get_log_name(prefix='wooting_log_'):
-    for i in range(10000):
-        fname = os.path.join('{}{:04d}.csv'.format(prefix, i))
-        if not os.path.exists(os.path.join(fname)):
-            return fname
+def get_log_name(prefix: str = 'wooting_log_') -> str:
+    """
+    Return a timestamped log file name.
 
-    return None
+    Args:
+        prefix (str): a prefix for the filename
+
+    Returns:
+        str: a filename of the form "<prefix>YYYYmmdd_HHMMSS.csv"
+    """
+    now = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    return f'{prefix}{now}.csv'
 
 if __name__ == "__main__":
-        wp = WootingPython()
-        print('> Checking if keyboard is connected...')
-        if not wp.is_connected():
-            print('> ERROR: No keyboard found! Connect it and try again.')
-            sys.exit(-1)
+    wp = WootingPython('libwooting_analog_wrapper.so')
 
-        # NOTE: on the Wooting Two I was testing this on, it seemed to keep 
-        # registering keypresses on codes 88 & 89 even when nothing was touching
-        # the device. These codes aren't listed on the keymap either. If anything
-        # similar happens with your keyboard, you can filter out those specific
-        # keycodes from the returned results like this:
-        wp.set_excluded_keys([88, 89])
+    logfile_name = get_log_name()
+    print(f'> Will record data to: {logfile_name}')
+    print('> Press <Space> to begin recording, <Esc> to exit')
 
-        print('> Keyboard found OK!')
-        logfile_name = get_log_name()
-        print('> Will record data to: {}'.format(logfile_name))
-        print('> Press <Space> to begin recording, <Esc> to exit')
+    wp.wait_for_key(SCAN_CODE_SPACE)
+    rows = 0
+    logging = True
+    last_keys_pressed = -1
 
-        wp.wait_for_key(SCAN_CODE_SPACE)
+    with open(logfile_name, 'w') as logfile:
+        logcsv = csv.writer(logfile, delimiter=',')
+        while logging:
+            key_states = wp.read_full_buffer(True)
+            if len(key_states) != last_keys_pressed:
+                print(f'Keys pressed: {len(key_states)}')
+                last_keys_pressed = len(key_states)
 
-        with open(logfile_name, 'w') as logfile:
-            # set up a CSV file for storing the data
-            logcsv = csv.writer(logfile, delimiter=',')
-            rows = 0
-            while True:
-                keys_pressed, scan_codes, analog_values, codes_and_values = wp.read_full_buffer()
-                print('{} keys pressed'.format(keys_pressed))
-                if SCAN_CODE_ESC in scan_codes:
-                    break
+            for code, value in key_states:
+                if code == SCAN_CODE_ESC:
+                    logging = False
 
-                # each row of the CSV file will contain these fields:
-                #   1. a timestamp (in seconds)
-                #   2. the number of keys pressed at that time
-                #   3. a single string containing the scan codes and analog values,
-                #       separated by | chars (note that the total number of values will
-                #       be <number of keys pressed * 2> !)
-                #
-                # (this could easily be modified, e.g. if you want to have a variable number of
-                # fields on each row and save the pressed keys directly)
-                row = [str(time.time()), str(keys_pressed), '|'.join(map(str, codes_and_values))]
-                logcsv.writerow(row)
-                rows += 1
-                time.sleep(SLEEP_TIME)
+            # each row of the CSV file will contain these fields:
+            #   1. a timestamp (in seconds)
+            #   2. the number of keys pressed at that time
+            #   3. a single string containing the scan codes and analog values,
+            #       separated by | chars (note that the total number of values will
+            #       be <number of keys pressed * 2> !)
+            #
+            # (this could easily be modified, e.g. if you want to have a variable number of
+            # fields on each row and save the pressed keys directly)
+            row = [str(time.time()), str(len(key_states)), '|'.join(map(str, [x for key_state in key_states for x in key_state]))]
+            logcsv.writerow(row)
+            rows += 1
+            time.sleep(0.001)
 
-            print('Recorded {} data points'.format(rows))
+        print('Recorded {} data points'.format(rows))
