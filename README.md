@@ -2,7 +2,7 @@
 
 This is a basic script showing how to read keypress data from a Wooting One/Two keyboard using the [Wooting Analog SDK](https://github.com/WootingKb/wooting-analog-sdk).
 
-The Wooting SDK has a C interface, so this script uses `ctypes` to accces methods in the dynamic libraries provided. It doesn't expose all the functionality in the SDK but should allow reading of key states.
+The Wooting SDK has a C interface, so this script uses `ctypes` to access methods in the dynamic libraries provided. It doesn't expose all the functionality in the SDK but should allow reading of key states.
 
 Instructions:
 
